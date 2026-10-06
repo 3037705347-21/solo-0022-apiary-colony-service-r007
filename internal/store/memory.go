@@ -1,0 +1,299 @@
+package store
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"example.com/apiary-colony-service/internal/domain"
+)
+
+// Memory 是并发安全的内存仓储。所有写入都在写锁内完成状态校验，
+// 读取则通过 Snapshot 得到一致视图。
+type Memory struct {
+	mu sync.RWMutex
+
+	apiaries    map[string]domain.Apiary
+	hives       map[string]domain.Hive
+	hiveIndex   map[string]map[string]domain.Hive
+	inspections map[string][]domain.Inspection
+	queens      map[string][]domain.Queen
+
+	installations map[string]hiveInstallation
+	installSeq    int
+	inspectionSeq int
+	queenSeq      int
+}
+
+// HiveReservation 是一次蜂箱安装的编号预留凭证。安装分为预留与提交两个
+// 阶段：预留只登记编号，蜂箱要等到提交阶段才真正进入仓储。
+type HiveReservation struct {
+	Token    string
+	ApiaryID string
+	HiveID   string
+}
+
+type hiveInstallation struct {
+	reservation HiveReservation
+	committed   bool
+}
+
+func NewMemory() *Memory {
+	return &Memory{
+		apiaries:      make(map[string]domain.Apiary),
+		hives:         make(map[string]domain.Hive),
+		hiveIndex:     make(map[string]map[string]domain.Hive),
+		installations: make(map[string]hiveInstallation),
+		inspections:   make(map[string][]domain.Inspection),
+		queens:        make(map[string][]domain.Queen),
+	}
+}
+
+func (m *Memory) CreateApiary(apiary domain.Apiary) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apiaries[apiary.ID]; ok {
+		return domain.Conflict("蜂场 %q 已存在", apiary.ID)
+	}
+	m.apiaries[apiary.ID] = apiary
+	return nil
+}
+
+func (m *Memory) GetApiary(id string) (domain.Apiary, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	apiary, ok := m.apiaries[id]
+	return apiary, ok
+}
+
+// ReserveHive 为一次蜂箱安装登记编号预留。预留在提交之前不会写出蜂箱，
+// 但已经能阻止同一编号被第二次安装复用。
+func (m *Memory) ReserveHive(apiaryID, hiveID string) (HiveReservation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.hives[hiveID]; exists {
+		return HiveReservation{}, domain.Conflict("蜂箱 %q 已存在", hiveID)
+	}
+	for _, installation := range m.installations {
+		if installation.reservation.HiveID != hiveID {
+			continue
+		}
+		if !installation.committed {
+			return HiveReservation{}, domain.Conflict("蜂箱 %q 的安装正在进行", hiveID)
+		}
+	}
+	m.installSeq++
+	reservation := HiveReservation{
+		Token:    fmt.Sprintf("install-%06d", m.installSeq),
+		ApiaryID: apiaryID,
+		HiveID:   hiveID,
+	}
+	m.installations[reservation.Token] = hiveInstallation{reservation: reservation}
+	return reservation, nil
+}
+
+// CommitHive 把已经预留的蜂箱写入仓储，并按蜂箱上的蜂场归属登记到该
+// 蜂场的索引里。
+func (m *Memory) CommitHive(hive domain.Hive, reservation HiveReservation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	installation, ok := m.installations[reservation.Token]
+	if !ok || installation.committed {
+		return domain.Conflict("蜂箱 %q 的安装预留不存在或已提交", hive.ID)
+	}
+	if _, exists := m.hives[hive.ID]; exists {
+		return domain.Conflict("蜂箱 %q 已存在", hive.ID)
+	}
+	m.hives[hive.ID] = hive
+	members := m.hiveIndex[hive.ApiaryID]
+	if members == nil {
+		members = make(map[string]domain.Hive)
+		m.hiveIndex[hive.ApiaryID] = members
+	}
+	members[hive.ID] = hive
+	installation.committed = true
+	m.installations[reservation.Token] = installation
+	return nil
+}
+
+func (m *Memory) GetHive(id string) (domain.Hive, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	hive, ok := m.hives[id]
+	return hive, ok
+}
+
+// AdvanceHive 在同一把写锁内完成状态读取、迁移校验与写入，避免并发迁移产生交错结果。
+func (m *Memory) AdvanceHive(hiveID string, target domain.HiveState, _ time.Time) (domain.Transition, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hive, ok := m.hives[hiveID]
+	if !ok {
+		return domain.Transition{}, domain.NotFound("蜂箱", hiveID)
+	}
+	if hive.State == target {
+		return domain.Transition{}, domain.InvalidState("蜂箱 %q 已经处于状态 %q", hiveID, target)
+	}
+	if !domain.CanTransitionHive(hive.State, target) {
+		return domain.Transition{}, domain.InvalidState(
+			"蜂箱 %q 不允许从 %q 迁移到 %q", hiveID, hive.State, target)
+	}
+	from := hive.State
+	hive.State = target
+	m.hives[hiveID] = hive
+	return domain.Transition{HiveID: hiveID, From: from, To: target}, nil
+}
+
+// AddInspection 分配巡检编号、写入记录，并推进蜂箱的最近巡检时间。
+// 蜂箱存在与可接受巡检的判定与写入处于同一把锁，避免退役与巡检之间的竞态。
+func (m *Memory) AddInspection(hiveID string, inspection domain.Inspection) (domain.Inspection, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hive, ok := m.hives[hiveID]
+	if !ok {
+		return domain.Inspection{}, domain.NotFound("蜂箱", hiveID)
+	}
+	if !hive.AcceptsInspection() {
+		return domain.Inspection{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受巡检", hiveID, hive.State)
+	}
+	m.inspectionSeq++
+	inspection.ID = fmt.Sprintf("inspection-%06d", m.inspectionSeq)
+	inspection.HiveID = hiveID
+	m.inspections[hiveID] = append(m.inspections[hiveID], inspection)
+
+	observedAt := inspection.ObservedAt
+	hive.LastInspectionAt = &observedAt
+	m.hives[hiveID] = hive
+	return inspection, nil
+}
+
+// AddQueen 关闭原有产卵蜂王并写入新蜂王，两件事在同一把锁内完成，
+// 保证任意时刻同一蜂箱至多只有一只 laying 蜂王。
+func (m *Memory) AddQueen(
+	hiveID string,
+	queen domain.Queen,
+	closeQueenID string,
+	closeState domain.QueenState,
+	now time.Time,
+) (domain.Queen, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hive, ok := m.hives[hiveID]
+	if !ok {
+		return domain.Queen{}, domain.NotFound("蜂箱", hiveID)
+	}
+	if !hive.AcceptsQueenChange() {
+		return domain.Queen{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受换王", hiveID, hive.State)
+	}
+	if closeQueenID != "" {
+		if err := m.closeQueenLocked(hiveID, closeQueenID, closeState, now); err != nil {
+			return domain.Queen{}, err
+		}
+	}
+	m.queenSeq++
+	queen.ID = fmt.Sprintf("queen-%06d", m.queenSeq)
+	queen.HiveID = hiveID
+	queen.State = domain.QueenLaying
+	m.queens[hiveID] = append(m.queens[hiveID], queen)
+
+	hive.ActiveQueenID = queen.ID
+	m.hives[hiveID] = hive
+	return queen, nil
+}
+
+func (m *Memory) closeQueenLocked(hiveID, queenID string, state domain.QueenState, now time.Time) error {
+	items := m.queens[hiveID]
+	for index, item := range items {
+		if item.ID != queenID {
+			continue
+		}
+		if !item.IsLaying() {
+			return domain.Conflict("蜂王 %q 已经关闭", queenID)
+		}
+		closedAt := now.UTC()
+		item.State = state
+		item.ClosedAt = &closedAt
+		items[index] = item
+		m.queens[hiveID] = items
+		return nil
+	}
+	return domain.Storage("蜂箱 %q 上的蜂王 %q 记录缺失", hiveID, queenID)
+}
+
+func (m *Memory) ListInspections(hiveID string) ([]domain.Inspection, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.hives[hiveID]; !ok {
+		return nil, domain.NotFound("蜂箱", hiveID)
+	}
+	items := m.inspections[hiveID]
+	out := make([]domain.Inspection, len(items))
+	copy(out, items)
+	return out, nil
+}
+
+func (m *Memory) ListQueens(hiveID string) ([]domain.Queen, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.hives[hiveID]; !ok {
+		return nil, domain.NotFound("蜂箱", hiveID)
+	}
+	items := m.queens[hiveID]
+	out := make([]domain.Queen, len(items))
+	copy(out, items)
+	return out, nil
+}
+
+// Snapshot 返回深拷贝的一致视图，供汇总类读取使用。
+func (m *Memory) Snapshot() Snapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snapshot := Snapshot{
+		Apiaries:          make(map[string]domain.Apiary, len(m.apiaries)),
+		Hives:             make(map[string]domain.Hive, len(m.hives)),
+		HiveIndex:         make(map[string][]domain.Hive, len(m.hiveIndex)),
+		InspectionsByHive: make(map[string][]domain.Inspection, len(m.inspections)),
+		QueensByHive:      make(map[string][]domain.Queen, len(m.queens)),
+	}
+	for id, apiary := range m.apiaries {
+		snapshot.Apiaries[id] = apiary
+	}
+	for id, hive := range m.hives {
+		snapshot.Hives[id] = cloneHive(hive)
+	}
+	for apiaryID, members := range m.hiveIndex {
+		copied := make([]domain.Hive, 0, len(members))
+		for _, hive := range members {
+			copied = append(copied, cloneHive(hive))
+		}
+		snapshot.HiveIndex[apiaryID] = copied
+	}
+	for id, items := range m.inspections {
+		copied := make([]domain.Inspection, len(items))
+		copy(copied, items)
+		for index := range copied {
+			copied[index].Concerns = append([]string{}, items[index].Concerns...)
+		}
+		snapshot.InspectionsByHive[id] = copied
+	}
+	for id, items := range m.queens {
+		copied := make([]domain.Queen, len(items))
+		copy(copied, items)
+		for index := range copied {
+			if items[index].ClosedAt != nil {
+				closedAt := *items[index].ClosedAt
+				copied[index].ClosedAt = &closedAt
+			}
+		}
+		snapshot.QueensByHive[id] = copied
+	}
+	return snapshot
+}
+
+func cloneHive(hive domain.Hive) domain.Hive {
+	if hive.LastInspectionAt != nil {
+		observedAt := *hive.LastInspectionAt
+		hive.LastInspectionAt = &observedAt
+	}
+	return hive
+}
