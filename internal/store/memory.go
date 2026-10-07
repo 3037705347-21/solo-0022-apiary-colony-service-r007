@@ -15,37 +15,19 @@ type Memory struct {
 
 	apiaries    map[string]domain.Apiary
 	hives       map[string]domain.Hive
-	hiveIndex   map[string]map[string]domain.Hive
 	inspections map[string][]domain.Inspection
 	queens      map[string][]domain.Queen
 
-	installations map[string]hiveInstallation
-	installSeq    int
 	inspectionSeq int
 	queenSeq      int
 }
 
-// HiveReservation 是一次蜂箱安装的编号预留凭证。安装分为预留与提交两个
-// 阶段：预留只登记编号，蜂箱要等到提交阶段才真正进入仓储。
-type HiveReservation struct {
-	Token    string
-	ApiaryID string
-	HiveID   string
-}
-
-type hiveInstallation struct {
-	reservation HiveReservation
-	committed   bool
-}
-
 func NewMemory() *Memory {
 	return &Memory{
-		apiaries:      make(map[string]domain.Apiary),
-		hives:         make(map[string]domain.Hive),
-		hiveIndex:     make(map[string]map[string]domain.Hive),
-		installations: make(map[string]hiveInstallation),
-		inspections:   make(map[string][]domain.Inspection),
-		queens:        make(map[string][]domain.Queen),
+		apiaries:    make(map[string]domain.Apiary),
+		hives:       make(map[string]domain.Hive),
+		inspections: make(map[string][]domain.Inspection),
+		queens:      make(map[string][]domain.Queen),
 	}
 }
 
@@ -66,53 +48,18 @@ func (m *Memory) GetApiary(id string) (domain.Apiary, bool) {
 	return apiary, ok
 }
 
-// ReserveHive 为一次蜂箱安装登记编号预留。预留在提交之前不会写出蜂箱，
-// 但已经能阻止同一编号被第二次安装复用。
-func (m *Memory) ReserveHive(apiaryID, hiveID string) (HiveReservation, error) {
+// CreateHive 在同一把写锁内确认蜂场存在且蜂箱编号全局唯一，然后原子写入
+// 蜂箱。任一前置条件不满足时仓储保持原状，不会留下孤儿蜂箱或编号预留。
+func (m *Memory) CreateHive(hive domain.Hive) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.hives[hiveID]; exists {
-		return HiveReservation{}, domain.Conflict("蜂箱 %q 已存在", hiveID)
-	}
-	for _, installation := range m.installations {
-		if installation.reservation.HiveID != hiveID {
-			continue
-		}
-		if !installation.committed {
-			return HiveReservation{}, domain.Conflict("蜂箱 %q 的安装正在进行", hiveID)
-		}
-	}
-	m.installSeq++
-	reservation := HiveReservation{
-		Token:    fmt.Sprintf("install-%06d", m.installSeq),
-		ApiaryID: apiaryID,
-		HiveID:   hiveID,
-	}
-	m.installations[reservation.Token] = hiveInstallation{reservation: reservation}
-	return reservation, nil
-}
-
-// CommitHive 把已经预留的蜂箱写入仓储，并按蜂箱上的蜂场归属登记到该
-// 蜂场的索引里。
-func (m *Memory) CommitHive(hive domain.Hive, reservation HiveReservation) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	installation, ok := m.installations[reservation.Token]
-	if !ok || installation.committed {
-		return domain.Conflict("蜂箱 %q 的安装预留不存在或已提交", hive.ID)
+	if _, ok := m.apiaries[hive.ApiaryID]; !ok {
+		return domain.NotFound("蜂场", hive.ApiaryID)
 	}
 	if _, exists := m.hives[hive.ID]; exists {
 		return domain.Conflict("蜂箱 %q 已存在", hive.ID)
 	}
 	m.hives[hive.ID] = hive
-	members := m.hiveIndex[hive.ApiaryID]
-	if members == nil {
-		members = make(map[string]domain.Hive)
-		m.hiveIndex[hive.ApiaryID] = members
-	}
-	members[hive.ID] = hive
-	installation.committed = true
-	m.installations[reservation.Token] = installation
 	return nil
 }
 
@@ -251,23 +198,22 @@ func (m *Memory) Snapshot() Snapshot {
 	snapshot := Snapshot{
 		Apiaries:          make(map[string]domain.Apiary, len(m.apiaries)),
 		Hives:             make(map[string]domain.Hive, len(m.hives)),
-		HiveIndex:         make(map[string][]domain.Hive, len(m.hiveIndex)),
+		HiveIndex:         make(map[string][]domain.Hive),
 		InspectionsByHive: make(map[string][]domain.Inspection, len(m.inspections)),
 		QueensByHive:      make(map[string][]domain.Queen, len(m.queens)),
 	}
 	for id, apiary := range m.apiaries {
 		snapshot.Apiaries[id] = apiary
 	}
+	// 蜂场归属直接由蜂箱表派生，蜂箱是唯一事实源，避免再维护一份
+	// 可能与最新状态不一致的索引。
+	grouped := make(map[string][]domain.Hive, len(m.apiaries))
 	for id, hive := range m.hives {
-		snapshot.Hives[id] = cloneHive(hive)
+		cloned := cloneHive(hive)
+		snapshot.Hives[id] = cloned
+		grouped[hive.ApiaryID] = append(grouped[hive.ApiaryID], cloned)
 	}
-	for apiaryID, members := range m.hiveIndex {
-		copied := make([]domain.Hive, 0, len(members))
-		for _, hive := range members {
-			copied = append(copied, cloneHive(hive))
-		}
-		snapshot.HiveIndex[apiaryID] = copied
-	}
+	snapshot.HiveIndex = grouped
 	for id, items := range m.inspections {
 		copied := make([]domain.Inspection, len(items))
 		copy(copied, items)

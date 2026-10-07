@@ -52,6 +52,10 @@ func (s *Service) Apiary(id string) (domain.Apiary, error) {
 }
 
 func (s *Service) InstallHive(apiaryID string, input InstallHiveInput) (domain.Hive, error) {
+	// 先确认蜂场存在：蜂场不存在时整体不生效，仓储不会留下任何痕迹。
+	if _, err := s.Apiary(apiaryID); err != nil {
+		return domain.Hive{}, err
+	}
 	model, err := ParseHiveModel(input.Model)
 	if err != nil {
 		return domain.Hive{}, err
@@ -60,14 +64,8 @@ func (s *Service) InstallHive(apiaryID string, input InstallHiveInput) (domain.H
 	if err != nil {
 		return domain.Hive{}, err
 	}
-	reservation, err := s.store.ReserveHive(apiaryID, hive.ID)
-	if err != nil {
-		return domain.Hive{}, err
-	}
-	if err := s.store.CommitHive(hive, reservation); err != nil {
-		return domain.Hive{}, err
-	}
-	if _, err := s.Apiary(apiaryID); err != nil {
+	// 蜂场存在性与蜂箱编号唯一性在同一把写锁内复核并原子写入。
+	if err := s.store.CreateHive(hive); err != nil {
 		return domain.Hive{}, err
 	}
 	return hive, nil

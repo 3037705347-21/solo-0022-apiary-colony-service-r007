@@ -80,6 +80,32 @@ func checkHiveInstall(c *client) error {
 	}, 404, `"code":"not_found"`); err != nil {
 		return err
 	}
+	// 蜂场不存在时安装整体不生效：查不到蜂箱，正确蜂场的汇总里也没有它。
+	if _, err := c.expect("GET", "/hives/hive-09", nil, 404, `"code":"not_found"`); err != nil {
+		return err
+	}
+	report, err := c.expect("GET", "/apiaries/apiary-north/status", nil, 200, `"hiveCount":1`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(report.text(), "hive-09") {
+		return fmt.Errorf("失败安装不应在蜂场汇总留下痕迹：%s", report.text())
+	}
+	// 同一编号随后装到正确蜂场应成功，而不是被判成重复编号。
+	if _, err := c.expect("POST", "/apiaries/apiary-north/hives", map[string]any{
+		"id": "hive-09", "model": "warre",
+	}, 201, `"state":"colonized"`, `"apiaryId":"apiary-north"`); err != nil {
+		return err
+	}
+	if _, err := c.expect("GET", "/hives/hive-09", nil, 200, `"apiaryId":"apiary-north"`); err != nil {
+		return err
+	}
+	// 同一编号再次安装仍判冲突：一个编号只对应唯一一座蜂场下的唯一一只蜂箱。
+	if _, err := c.expect("POST", "/apiaries/apiary-north/hives", map[string]any{
+		"id": "hive-09", "model": "warre",
+	}, 409, `"code":"conflict"`); err != nil {
+		return err
+	}
 	if _, err := c.expect("POST", "/apiaries/apiary-north/hives", map[string]any{
 		"id": "hive-02", "model": "dadant",
 	}, 400, `"code":"invalid_request"`); err != nil {
@@ -199,6 +225,10 @@ func checkReadApiaryStatus(c *client) error {
 		`"to":"production"`); err != nil {
 		return err
 	}
+	// 按编号查询与逐蜂箱明细必须反映同一份最新事实：hive-02 已是 production。
+	if _, err := c.expect("GET", "/hives/hive-02", nil, 200, `"state":"production"`); err != nil {
+		return err
+	}
 	if _, err := c.expect("POST", "/hives/hive-01/inspections", map[string]any{
 		"observedAt": "2026-04-10T09:00:00Z", "colonyStrength": 4, "broodPattern": "solid",
 		"temper": "calm", "miteCount": 12, "note": "",
@@ -206,7 +236,8 @@ func checkReadApiaryStatus(c *client) error {
 		return err
 	}
 	report, err := c.expect("GET", "/apiaries/apiary-north/status?asOf=2026-04-12T00:00:00Z", nil, 200,
-		`"hiveCount":3`, `"colonized":2`, `"production":1`, `"layingQueens":0`)
+		`"hiveCount":3`, `"colonized":2`, `"production":1`, `"layingQueens":0`,
+		`"hiveId":"hive-02","state":"production"`)
 	if err != nil {
 		return err
 	}
