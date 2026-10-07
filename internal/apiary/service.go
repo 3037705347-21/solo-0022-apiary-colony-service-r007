@@ -51,7 +51,12 @@ func (s *Service) Apiary(id string) (domain.Apiary, error) {
 	return apiary, nil
 }
 
+// InstallHive 先确认蜂场存在，再校验箱型与编号唯一性，最后一次性提交蜂箱。
+// 蜂场不存在时直接返回未找到，不产生预留也不写入蜂箱，安装整体不留痕迹。
 func (s *Service) InstallHive(apiaryID string, input InstallHiveInput) (domain.Hive, error) {
+	if _, err := s.Apiary(apiaryID); err != nil {
+		return domain.Hive{}, err
+	}
 	model, err := ParseHiveModel(input.Model)
 	if err != nil {
 		return domain.Hive{}, err
@@ -65,9 +70,6 @@ func (s *Service) InstallHive(apiaryID string, input InstallHiveInput) (domain.H
 		return domain.Hive{}, err
 	}
 	if err := s.store.CommitHive(hive, reservation); err != nil {
-		return domain.Hive{}, err
-	}
-	if _, err := s.Apiary(apiaryID); err != nil {
 		return domain.Hive{}, err
 	}
 	return hive, nil

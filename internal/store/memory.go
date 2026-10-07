@@ -13,9 +13,11 @@ import (
 type Memory struct {
 	mu sync.RWMutex
 
-	apiaries    map[string]domain.Apiary
-	hives       map[string]domain.Hive
-	hiveIndex   map[string]map[string]domain.Hive
+	apiaries map[string]domain.Apiary
+	hives    map[string]domain.Hive
+	// hiveIndex 只登记蜂箱编号归属哪座蜂场；蜂箱内容始终以 hives 为
+	// 唯一事实来源，快照在读取时刻按编号关联最新蜂箱，索引本身不留存副本。
+	hiveIndex   map[string]map[string]struct{}
 	inspections map[string][]domain.Inspection
 	queens      map[string][]domain.Queen
 
@@ -42,7 +44,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		apiaries:      make(map[string]domain.Apiary),
 		hives:         make(map[string]domain.Hive),
-		hiveIndex:     make(map[string]map[string]domain.Hive),
+		hiveIndex:     make(map[string]map[string]struct{}),
 		installations: make(map[string]hiveInstallation),
 		inspections:   make(map[string][]domain.Inspection),
 		queens:        make(map[string][]domain.Queen),
@@ -92,8 +94,8 @@ func (m *Memory) ReserveHive(apiaryID, hiveID string) (HiveReservation, error) {
 	return reservation, nil
 }
 
-// CommitHive 把已经预留的蜂箱写入仓储，并按蜂箱上的蜂场归属登记到该
-// 蜂场的索引里。
+// CommitHive 把已经预留的蜂箱写入仓储，并把蜂箱编号登记到该蜂场的归属
+// 索引里；同一编号从此只对应这一座蜂场下的这一只蜂箱。
 func (m *Memory) CommitHive(hive domain.Hive, reservation HiveReservation) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -107,10 +109,10 @@ func (m *Memory) CommitHive(hive domain.Hive, reservation HiveReservation) error
 	m.hives[hive.ID] = hive
 	members := m.hiveIndex[hive.ApiaryID]
 	if members == nil {
-		members = make(map[string]domain.Hive)
+		members = make(map[string]struct{})
 		m.hiveIndex[hive.ApiaryID] = members
 	}
-	members[hive.ID] = hive
+	members[hive.ID] = struct{}{}
 	installation.committed = true
 	m.installations[reservation.Token] = installation
 	return nil
@@ -244,7 +246,8 @@ func (m *Memory) ListQueens(hiveID string) ([]domain.Queen, error) {
 	return out, nil
 }
 
-// Snapshot 返回深拷贝的一致视图，供汇总类读取使用。
+// Snapshot 返回深拷贝的一致视图，供汇总类读取使用。蜂场归属索引在快照
+// 时刻按编号关联 hives 中的最新蜂箱，保证汇总计数与逐只读取同源。
 func (m *Memory) Snapshot() Snapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -263,7 +266,11 @@ func (m *Memory) Snapshot() Snapshot {
 	}
 	for apiaryID, members := range m.hiveIndex {
 		copied := make([]domain.Hive, 0, len(members))
-		for _, hive := range members {
+		for hiveID := range members {
+			hive, ok := m.hives[hiveID]
+			if !ok {
+				continue
+			}
 			copied = append(copied, cloneHive(hive))
 		}
 		snapshot.HiveIndex[apiaryID] = copied
